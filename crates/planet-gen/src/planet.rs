@@ -635,6 +635,48 @@ impl Planet {
     }
 }
 
+/// Whether the brick at `coord` of mip `level` is wholly in the interior, which is solid all the
+/// way down: what both sources of a store say to [`BrickSource::solid_below`].
+fn inside_interior(level: usize, coord: BrickCoord) -> bool {
+    coord.within_ball_at(level, INTERIOR_RADIUS)
+}
+
+/// What a store reads where it holds no brick, when the Planet is to be drawn at every distance
+/// (the LOD bands, #84): the Planet itself, generated on demand at the level asked for. A brick
+/// of level 0 is [`Planet::brick`] and a coarse one is [`Planet::coarse_brick`], so the ground
+/// far from where the store holds bricks is drawn at the level its distance asks for, and
+/// costs a brick's worth of Voxels for each brick that holds ground. Measured on the client's
+/// first view of the full-size Planet (#84): 3.0 million bricks, 228 s on eight cores, so it is
+/// for a streaming loader (#86, #49) to ask for, not for a frame to wait on. Nothing calls it yet
+/// but its test: it is here for that loader.
+///
+/// A store holds the bricks that Edits changed and the region around the spawn; everything else
+/// is this. Unedited bricks are a cache that can be regenerated from the seed (ADR 0002).
+#[derive(Clone, Debug)]
+pub struct PlanetSource {
+    planet: Planet,
+}
+
+impl PlanetSource {
+    pub fn new(planet: Planet) -> Self {
+        Self { planet }
+    }
+}
+
+impl BrickSource for PlanetSource {
+    fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+        if level == 0 {
+            self.planet.brick(coord)
+        } else {
+            self.planet.coarse_brick(level, coord)
+        }
+    }
+
+    fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        inside_interior(level, coord)
+    }
+}
+
 /// What the store of [`Planet::region_around`] reads where it holds no brick. The store holds
 /// every brick of the region that is not air, so a brick it does not hold is one of these, each
 /// answered by a distance or two and never by generating anything (walking moves the renderer's
@@ -695,6 +737,10 @@ impl BrickSource for RegionSource {
             .iter()
             .find(|&&(outer, _)| coord.within_ball_at(level, outer))
             .map_or(Brick::AIR, |&(_, material)| Brick::solid(material))
+    }
+
+    fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        inside_interior(level, coord)
     }
 }
 
@@ -1684,6 +1730,27 @@ mod tests {
             assert!((dot(aside, aside) - 1.0).abs() < 1e-12);
             assert!(dot(ahead, up).abs() < 1e-12 && dot(aside, up).abs() < 1e-12);
             assert!(dot(ahead, aside).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_planet_source_gives_the_planets_own_bricks_at_every_level() {
+        let source = PlanetSource::new(planet().clone());
+        // On the ground, in the sky and deep inside, at level 0 and at coarse levels.
+        for radius in [
+            f64::from(WORLD_RADIUS) + 30.0,
+            f64::from(WORLD_RADIUS) + 400_000.0,
+            1000.0,
+        ] {
+            let coord = along([0.3, 0.8, 0.5], radius).brick();
+            assert_eq!(source.brick(0, coord), planet().brick(coord));
+            for level in 1..5 {
+                let coarse = BrickCoord(coord.0.map(|c| c >> level));
+                assert_eq!(
+                    source.brick(level, coarse),
+                    planet().coarse_brick(level, coarse)
+                );
+            }
         }
     }
 }

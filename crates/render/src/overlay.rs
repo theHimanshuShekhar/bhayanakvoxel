@@ -16,6 +16,19 @@ pub struct Controls {
     pub debug_view: DebugView,
     /// The sun's azimuth and elevation in radians (see [`Sun::from_angles`](crate::Sun)).
     pub sun: (f32, f32),
+    /// The LOD bias: output pixels one Voxel may cover (see [`Bands`](crate::lod::Bands)). It
+    /// changes when the slider is let go, not while it is dragged, since selecting the bricks
+    /// again takes a moment.
+    pub bias: f32,
+}
+
+/// What the bands have selected, for the panel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LodInfo {
+    /// Distance in metres at which level 0 ends and level 1 starts: twice `d0`.
+    pub switch_m: f64,
+    /// Bricks drawn at each level, finest first.
+    pub bricks: Vec<usize>,
 }
 
 /// How much GPU memory the Planet's bricks take, in bytes.
@@ -35,6 +48,8 @@ pub struct Info<'a> {
     /// Samples in the reference image so far.
     pub samples: u32,
     pub scene_memory: SceneMemory,
+    /// What the LOD bands selected, once there is a Planet.
+    pub lod: Option<LodInfo>,
 }
 
 /// A time for the panel: milliseconds, or "n/a" where there is none.
@@ -61,6 +76,38 @@ fn timer_row(ui: &mut egui::Ui, name: &str, series: &Series, active: bool) {
     ui.monospace(ms(series.average()));
     ui.monospace(ms(series.max()));
     ui.end_row();
+}
+
+/// The bias slider and what the bands made of it. The slider keeps its own value while it is
+/// dragged, and `controls.bias` takes it when it is let go (or typed): selecting the bricks again
+/// is not something to do for every pixel of a drag.
+fn lod_rows(ui: &mut egui::Ui, lod: Option<&LodInfo>, controls: &mut Controls) {
+    let id = ui.make_persistent_id("lod bias");
+    let mut shown: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(controls.bias);
+    let response = ui.add(
+        Slider::new(&mut shown, 0.25..=4.0)
+            .logarithmic(true)
+            .text("LOD bias (px per Voxel)"),
+    );
+    ui.data_mut(|d| d.insert_temp(id, shown));
+    if response.drag_stopped() || (response.changed() && !response.dragged()) {
+        controls.bias = shown;
+    }
+    if !response.dragged() && !response.has_focus() {
+        // Follow the value when it was changed from elsewhere (the command line).
+        ui.data_mut(|d| d.insert_temp(id, controls.bias));
+    }
+    if let Some(lod) = lod {
+        ui.label(format!("level 0 to 1 at {:.0} m", lod.switch_m));
+        let bricks: Vec<String> = lod
+            .bricks
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(level, n)| format!("L{level} {n}"))
+            .collect();
+        ui.label(format!("bricks: {}", bricks.join("  ")));
+    }
 }
 
 /// Lays out the panel on `ctx`, and writes the user's changes to the settings in `controls`.
@@ -91,6 +138,8 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 mib(info.scene_memory.used),
                 mib(info.scene_memory.allocated)
             ));
+            ui.separator();
+            lod_rows(ui, info.lod.as_ref(), controls);
             ui.separator();
 
             let mut reference = controls.mode == Mode::Reference;
@@ -165,6 +214,7 @@ mod tests {
             mode: Mode::Primary,
             debug_view: DebugView::Lit,
             sun: (0.5, 0.8),
+            bias: 1.0,
         }
     }
 
@@ -195,6 +245,7 @@ mod tests {
             timers_supported: true,
             samples: 0,
             scene_memory: SceneMemory::default(),
+            lod: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("N: walk / noclip"), "{text}");
@@ -225,6 +276,10 @@ mod tests {
                 used: 5 * 1024 * 1024 + 512 * 1024,
                 allocated: 64 * 1024 * 1024,
             },
+            lod: Some(LodInfo {
+                switch_m: 205.6,
+                bricks: vec![1200, 0, 340],
+            }),
         };
         let text = draw(&info, &mut controls());
         for expected in [
@@ -238,6 +293,9 @@ mod tests {
             "3.000",
             "frame (CPU)",
             "planet memory: 5.5 of 64.0 MiB",
+            "LOD bias",
+            "level 0 to 1 at 206 m",
+            "bricks: L0 1200  L2 340",
         ] {
             assert!(text.contains(expected), "no {expected:?} in:\n{text}");
         }
@@ -255,6 +313,7 @@ mod tests {
             timers_supported: false,
             samples: 0,
             scene_memory: SceneMemory::default(),
+            lod: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("GPU timers: not supported"), "{text}");
@@ -269,11 +328,13 @@ mod tests {
             timers_supported: true,
             samples: 42,
             scene_memory: SceneMemory::default(),
+            lod: None,
         };
         let mut controls = Controls {
             mode: Mode::Reference,
             debug_view: DebugView::Depth,
             sun: (0.5, 0.8),
+            bias: 1.0,
         };
         let before = controls;
         let text = draw(&info, &mut controls);

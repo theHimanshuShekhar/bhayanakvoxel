@@ -37,6 +37,8 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
 | `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
+| `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it. A report with another bias is not comparable with the budgets. |
+| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). A report made with any of them is not a measurement. See "Reading a regression" below. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget. |
 
@@ -50,10 +52,11 @@ file, a bad option).
 
 ### What it does
 
-1. Generates the test Planet and uploads it to the GPU, as camera-centred rings of levels of
-   detail (ADR 0002), and prints how much GPU memory they take. The rings follow the camera
-   along the path: moving them (packing the regions that come in, writing them to the GPU) is
-   done before a frame is timed, so it is in no pass and not in the frame's CPU time either.
+1. Generates the test Planet and uploads it to the GPU, each brick at the level of detail its
+   distance from the camera says (the LOD bands, ADR 0002), and prints how much GPU memory they
+   take and how many bricks each level has. The bands follow the camera along the path: selecting
+   again and packing the bricks that change level, and writing them to the GPU, is done before a
+   frame is timed, so it is in no pass and not in the frame's CPU time either.
 2. Flies the camera path in **primary mode**, then in **reference mode** (the progressive path
    tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
    not measured: the first frames after a mode switch carry the other mode's state (see the notes
@@ -64,6 +67,12 @@ file, a bad option).
    not mostly readback with the GPU idle in between; `frame_time` is then the CPU time of the
    frame as drawn, and a screenshot frame is slower.
 3. Writes a screenshot at each keyframe of the path, per mode.
+4. Then, after the flight, holds the camera still at four heights above the Planet's mean radius
+   (4.8 m, which is the ground, 100 m, 500 m and 2 km), looking at the ground that slopes away
+   towards the horizon, and times both modes there for a few dozen frames each (24 primary frames
+   and 6 reference frames of 2 samples). That is the report's `altitudes`. It takes a few seconds
+   and leaves the flight alone, so the flight stays comparable with the reports of main. `--short`
+   has no sweep.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
@@ -81,18 +90,21 @@ before reading anything into the times.
 
 ```
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
                "timers_supported" },
   "config":  { "width", "height", "output_width", "output_height", "scene", "path",
-               "keyframes" },                  // width, height: traced; output_*: upscaled
+               "keyframes", "bias" },          // width, height: traced; output_*: upscaled
   "modes": {
     "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
-                   "frame_time": STATS },
+                   "frame_time": STATS, "scene_update_ms": STATS,
+                   "lod_at_keyframes": [ { "frame", "height_m", "bricks": [n...] }... ] },
     "reference": { ... same ... }
   },
+  "altitudes": [ { "height_m", "bricks": [n...], "primary": STATS, "upscale": STATS,
+                   "reference": STATS }... ],
   "screenshots": [ "primary-frame0000.png", ... ],
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] }
 }
@@ -114,10 +126,39 @@ before reading anything into the times.
 - `frame_time` is CPU time to draw one frame of the path, and to read the image back where it is
   read (reference mode, and primary mode's screenshot frames). For reference mode a frame is all
   its samples. It is context, not a budget.
+- `scene_update_ms` is the CPU time per frame that the Planet takes to follow the camera: the
+  bands select the bricks again, those that changed level are packed, and the changes are written
+  to the GPU, flushed at once. It is done before the frame is timed, so it is in no pass and not
+  in `frame_time`, but a window pays it. Its mean is CPU time, not GPU time, and a CPU that is
+  slow to follow leaves the GPU idle between frames (see below).
+- `lod_at_keyframes` has, for each keyframe of the path, the frame, how high the camera is above
+  the Planet's mean radius in metres, and how many bricks are drawn at each level of detail
+  (level 0 first). Empty for `--short`.
+- `altitudes` is the sweep: for each height, the bricks drawn at each level and the `primary` and
+  `upscale` passes of primary mode and the `reference` pass of reference mode (one sample), with
+  no budget held against them. It is how the cost of the LOD bands is read at the ground, 100 m,
+  500 m and 2 km.
 - `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
   a shadows pass): they are not an error.
 
 The mean is what is held to the budget; look at `p95_ms` and `max_ms` for stutter.
+
+### Reading a regression
+
+A pass whose work did not change but whose time did (the `upscale` pass does not read the Planet)
+points at how the frames are paced, not at the pass. The bench draws one frame at a time and
+waits for it, so the GPU idles for as long as the CPU takes to follow the camera
+(`scene_update_ms`) before the next frame, and a GPU that has idled may time a pass that is
+limited by memory (`upscale` is) differently from one that has not. To tell the Planet's GPU work
+from that gap, run the bench with `--diag` and compare `upscale` and `reference` against a plain
+run (the camera path is the same):
+
+| Run | If `upscale` falls back to main's | It is |
+| --- | --- | --- |
+| `--diag no-follow` | yes | something in following the camera: the next three say which |
+| `--diag no-follow,gap-ms=N` (N about `scene_update_ms`) | no, it stays high | the idle gap: nothing the Planet sends to the GPU |
+| `--diag no-upload` | no, it stays high | the CPU's time, not the writes |
+| `--diag no-flush` | yes | the writes being sent at once, ahead of the frame |
 
 ## Budgets
 

@@ -242,6 +242,15 @@ impl Brick {
         }
     }
 
+    /// True when every Voxel of the brick is solid.
+    pub fn is_full(&self) -> bool {
+        match &self.0 {
+            Repr::Air => false,
+            Repr::Solid(_) => true,
+            Repr::Mixed(mixed) => mixed.occupancy.iter().all(|&w| w == u64::MAX),
+        }
+    }
+
     /// True when the brick is all air.
     pub fn is_air(&self) -> bool {
         matches!(self.0, Repr::Air)

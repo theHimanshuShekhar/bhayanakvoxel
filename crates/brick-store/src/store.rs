@@ -1,7 +1,7 @@
 //! Sparse hash index of bricks keyed by integer brick coordinate.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::brick::{Brick, Material};
@@ -26,6 +26,9 @@ use crate::lod::{BrickSource, downsample};
 #[derive(Clone, Debug, Default)]
 pub struct BrickStore {
     bricks: HashMap<BrickCoord, Brick>,
+    /// In the stores of the coarse levels: the bricks held there that have only solid Voxels of
+    /// level 0 under them, exactly (see [`BrickStore::solid_below`]). Empty at level 0.
+    solid_below: HashSet<BrickCoord>,
     /// Mip levels 1 and up, finest first. Empty when there is no pyramid; the stores in it have
     /// no pyramid or source of their own.
     coarse: Vec<BrickStore>,
@@ -123,6 +126,30 @@ impl BrickStore {
         }
     }
 
+    /// Whether the source says that every Voxel of level 0 under the brick at `coord` of `level`
+    /// is solid, for a brick that is not held (see [`BrickSource::solid_below`]).
+    pub fn source_solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.solid_below(level, coord))
+    }
+
+    /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, exactly.
+    /// A coarse brick that reads as full may still have air under it, since a coarse Voxel is
+    /// solid when half of its children are: the pyramid keeps this beside the brick, made with it.
+    /// Where the store holds no brick the source says (see [`BrickSource::solid_below`]).
+    pub fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        let Some(store) = self.level(level) else {
+            return false;
+        };
+        match store.bricks.get(&coord) {
+            Some(brick) if level == 0 => brick.is_full(),
+            Some(_) => store.solid_below.contains(&coord),
+            None if level == 0 => self.brick_at(0, coord).is_full(),
+            None => self.source_solid_below(level, coord),
+        }
+    }
+
     /// The Voxel at `coord` of mip `level`, as [`Self::brick_at`] reads it: `None` for air.
     pub fn voxel_at(&self, level: usize, coord: VoxelCoord) -> Option<Material> {
         self.brick_at(level, coord.brick()).get(coord.local())
@@ -186,6 +213,10 @@ impl BrickStore {
     fn remake_above(&mut self, changed: BTreeSet<BrickCoord>, beside: bool) -> LodRefresh {
         let mut refresh = LodRefresh::default();
         let mut moved = changed;
+        // The bricks whose `solid_below` changed, on the level just made. That is kept up past
+        // where the bricks stop changing (a hole too small to show on a coarse level still keeps
+        // the brick over it from being solid all the way down), but it remakes no brick.
+        let mut flipped: BTreeSet<BrickCoord> = BTreeSet::new();
         for level in 1..=self.coarse.len() {
             let over: BTreeSet<_> = moved
                 .iter()
@@ -195,8 +226,10 @@ impl BrickStore {
                 })
                 .map(BrickCoord::parent)
                 .collect();
+            let flags: BTreeSet<_> = flipped.iter().map(|c| c.parent()).collect();
             moved = BTreeSet::new();
-            for coord in over {
+            flipped = BTreeSet::new();
+            for &coord in &over {
                 let held = self.remake(level, coord);
                 refresh.remade += 1;
                 let (was_held, before) = match held {
@@ -212,7 +245,12 @@ impl BrickStore {
                     moved.insert(coord);
                 }
             }
-            if moved.is_empty() {
+            for &coord in over.union(&flags) {
+                if self.remake_solid_below(level, coord) {
+                    flipped.insert(coord);
+                }
+            }
+            if moved.is_empty() && flipped.is_empty() {
                 break;
             }
         }
@@ -242,6 +280,27 @@ impl BrickStore {
             Some(brick) => coarse.insert(coord, brick),
             None => coarse.remove(&coord),
         }
+    }
+
+    /// Works out [`Self::solid_below`] of the held brick `coord` of coarse level `level` again,
+    /// from the brick and the eight under it. Returns whether it changed.
+    fn remake_solid_below(&mut self, level: usize, coord: BrickCoord) -> bool {
+        let full = self.coarse[level - 1]
+            .bricks
+            .get(&coord)
+            .is_some_and(Brick::is_full);
+        let solid = full
+            && coord
+                .children()
+                .iter()
+                .all(|&c| self.solid_below(level - 1, c));
+        let store = &mut self.coarse[level - 1];
+        let was_solid = if solid {
+            !store.solid_below.insert(coord)
+        } else {
+            store.solid_below.remove(&coord)
+        };
+        solid != was_solid
     }
 
     /// What the brick at `coord` of mip `level` reads as where none is held there.
@@ -888,5 +947,69 @@ mod tests {
         };
         assert_ne!(hash(3, 3), hash(4, 3));
         assert_ne!(hash(3, 3), hash(3, 2));
+    }
+
+    /// A block of rock 4 bricks on a side, with a pyramid of two levels.
+    fn rock_block() -> BrickStore {
+        let mut store = BrickStore::new();
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(ROCK));
+                }
+            }
+        }
+        store.build_lod(2);
+        store
+    }
+
+    #[test]
+    fn a_coarse_brick_is_solid_below_only_if_every_voxel_under_it_is() {
+        let mut store = rock_block();
+        let top = BrickCoord([0, 0, 0]);
+        assert!(
+            store.solid_below(0, top) && store.solid_below(1, top) && store.solid_below(2, top)
+        );
+        // A hole of one Voxel does not change what the coarse bricks read as, which is a majority,
+        // but they are no longer solid all the way down: not the ones over it.
+        let before = store.brick_at(2, top).into_owned();
+        let hole = VoxelCoord([13, 13, 13]).brick();
+        store.set(VoxelCoord([13, 13, 13]), None);
+        let refresh = store.refresh_lod([hole]);
+        assert_eq!(
+            *store.brick_at(2, top),
+            before,
+            "the level 2 brick reads as it did"
+        );
+        assert!(refresh.remade >= 2);
+        assert!(!store.solid_below(0, hole));
+        assert!(!store.solid_below(1, hole.parent()));
+        assert!(!store.solid_below(2, top));
+        assert!(store.solid_below(0, BrickCoord([2, 2, 2])));
+        assert!(store.solid_below(1, BrickCoord([1, 1, 1])));
+        // Refreshing keeps it as building the pyramid afresh makes it, with the hole.
+        let mut fresh = store.clone();
+        fresh.build_lod(2);
+        assert_eq!(store.coarse[0].solid_below, fresh.coarse[0].solid_below);
+        assert_eq!(store.coarse[1].solid_below, fresh.coarse[1].solid_below);
+        // Filled again, it is.
+        store.set(VoxelCoord([13, 13, 13]), Some(ROCK));
+        store.refresh_lod([hole]);
+        assert!(store.solid_below(2, top));
+        let mut fresh = store.clone();
+        fresh.build_lod(2);
+        assert_eq!(store.coarse[1].solid_below, fresh.coarse[1].solid_below);
+    }
+
+    #[test]
+    fn where_the_store_holds_nothing_the_source_says_what_is_solid_below() {
+        let mut ball = BrickStore::new();
+        ball.set_source(Interior {
+            radius: 100,
+            material: ROCK,
+        });
+        ball.build_lod(2);
+        assert!(ball.solid_below(2, BrickCoord([0, 0, 0])));
+        assert!(!ball.solid_below(2, BrickCoord([5, 5, 5])));
     }
 }

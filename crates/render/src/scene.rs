@@ -38,13 +38,15 @@
 //! frame.
 //!
 //! [`Scene::new`] makes the one level of an ordinary scene, which holds all of its bricks.
-//! [`Scene::rings`] makes camera-centred *rings*, which are described at that function.
+//! [`Scene::rings`] makes a level for each mip, each listing the bricks that the LOD bands (see
+//! [`crate::lod`]) select for it; they are described at that function.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use brick_store::{Brick, BrickCoord, BrickStore, BrickView, Material};
 
 mod rings;
+pub mod select;
 
 pub use rings::{RingPatch, RingsFull, Room};
 
@@ -54,14 +56,13 @@ pub const REGION_BRICKS: i32 = 8;
 pub const REGION_VOXELS: i32 = 64;
 /// Words per region record: 16 mask words and the offset of its first brick entry.
 pub const REGION_WORDS: usize = 17;
+/// Where the offset of the first brick entry is in a region record, after the 16 words of the mask
+/// (so also how many words the mask has).
+pub const REGION_FIRST_REF: usize = REGION_WORDS - 1;
 /// Set in a brick entry for a brick that is one Material throughout.
 pub const SOLID_FLAG: u32 = 0x8000_0000;
-/// Regions along each edge of a ring's box. A ring then spans `1024 << level` Voxels, centred on
-/// the camera to within a region, and is used out to half that: its Voxels are then about a
-/// quarter of a degree across at the nearest, a couple of pixels at 1280×720.
-pub const RING_REGIONS: i32 = 16;
-/// Most levels a scene can have. Level `n` has regions `64 << n` Voxels across, and a ring's box
-/// must stay within `i32` Voxel coordinates: that is about 22 levels, so 20 leaves room.
+/// Most levels a scene can have. Level `n` has regions `64 << n` Voxels across, which must stay
+/// within `i32` Voxel coordinates: that is about 22 levels, so 20 leaves room.
 /// `MAX_LEVELS` in `trace.wgsl` is the same number.
 pub const MAX_LEVELS: usize = 20;
 
@@ -97,6 +98,12 @@ pub struct Level {
     /// are a power of two.
     pub table_base: u32,
     pub table_mask: u32,
+    /// The regions of the level that no brick of it can be in, because they are inside the ball
+    /// about the camera that the level's band starts outside of: from the first up to, and not
+    /// including, the end, in regions of this level. The walk skips them. None if the end is not
+    /// past the first, and for a scene that is not rings.
+    pub hole_first: [i32; 3],
+    pub hole_end: [i32; 3],
 }
 
 impl Level {
@@ -324,6 +331,7 @@ impl Scene {
                 occupied_end: max.map(|m| m + 1),
                 table_base: 0,
                 table_mask: slots as u32 - 1,
+                ..Level::default()
             }],
             table: vec![0; slots * 4],
             core,
@@ -580,12 +588,24 @@ impl Scene {
     }
 
     /// The radius that rays are clipped to, if the scene has a [`Bound`]: its radius, and the
-    /// diagonal of a Voxel of the coarsest level the scene has (which is as far as such a Voxel
+    /// diagonal of a Voxel of the coarsest level the scene draws (which is as far as such a Voxel
     /// can stick out), and [`BOUND_SLACK`].
     pub fn clip_radius(&self) -> Option<f32> {
         let bound = self.bound?;
-        let coarsest = (1u32 << self.levels.len().saturating_sub(1)) as f32;
+        let coarsest_level = self
+            .coarsest_drawn()
+            .unwrap_or(self.levels.len().saturating_sub(1));
+        let coarsest = (1u32 << coarsest_level) as f32;
         Some(bound.radius as f32 + coarsest * 3f32.sqrt() + BOUND_SLACK)
+    }
+
+    /// How many levels the walk goes through: those up to the coarsest that lists a region. The
+    /// levels past it have nothing to find, so rays do not look at them.
+    pub fn walked_levels(&self) -> usize {
+        self.levels
+            .iter()
+            .rposition(|l| (0..3).all(|a| l.occupied_end[a] > l.occupied_first[a]))
+            .map_or(0, |last| last + 1)
     }
 
     /// Index in `regions` of the region at absolute region coordinate `key` of mip `level`.

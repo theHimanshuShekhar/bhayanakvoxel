@@ -13,7 +13,8 @@ use fly::{Action, Fly};
 use net::Leash;
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
-use render::overlay::{self, Controls, SceneMemory};
+use render::lod::{self, Bands};
+use render::overlay::{self, Controls, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
@@ -51,23 +52,33 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
 
-/// Mip levels the client draws the Planet in: rings of them, each twice as coarse as the one
-/// inside it. The outermost is 65536 Voxels across, which is room to zoom out to ten times the
-/// distance of the spawn point.
-const RING_LEVELS: usize = 7;
+/// Mip levels the client draws the Planet in: the LOD bands pick one for each brick from its
+/// distance (see [`render::lod`]), 0 to 12, which reaches orbit at 50 Planet radii.
+const RING_LEVELS: usize = lod::LEVELS;
 
-/// A Planet's bricks packed for the GPU as rings around `camera`. The store must have its
-/// pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not hold. Nothing of the
-/// Planet is further from the centre than `radius`, the Planet's maximum radius (the full-size
-/// Planet's is [`planet_gen::planet::MAX_RADIUS`], the test one's [`planet_gen::MAX_RADIUS`]),
-/// so no ray need be walked beyond it.
-fn planet_scene(store: &BrickStore, camera: [f64; 3], radius: i32) -> Result<Scene, RingsFull> {
-    let mut scene = Scene::rings(store, camera, RING_LEVELS)?;
-    scene.bound = Some(Bound {
-        centre: [0; 3],
-        radius,
-    });
-    Ok(scene)
+/// The LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes it.
+const DEFAULT_BIAS: f32 = 1.0;
+
+/// A Planet's bricks, packed for the GPU as the bricks the LOD `bands` select from `camera`. The
+/// store must have its pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not
+/// hold. Nothing of the Planet is further from the centre than `radius`, the Planet's maximum
+/// radius (the full-size Planet's is [`planet_gen::planet::MAX_RADIUS`], the test one's
+/// [`planet_gen::MAX_RADIUS`]), so no ray need be walked beyond it.
+fn planet_scene(
+    store: &BrickStore,
+    camera: [f64; 3],
+    bands: Bands,
+    radius: i32,
+) -> Result<Scene, RingsFull> {
+    Scene::rings(
+        store,
+        camera,
+        bands,
+        Bound {
+            centre: [0; 3],
+            radius,
+        },
+    )
 }
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of
@@ -105,6 +116,10 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
     // Generation is deterministic, so the server's Planet is what generating it again would
     // give; copying it is quicker. The server draws nothing, so it needs no coarse levels.
     let server_store = store.clone();
+    // Beyond the region the store still reads the region's source: the deep rock and the air.
+    // `planet_gen::planet::PlanetSource` would draw the whole Planet at the level the bands ask
+    // for, but it generates the bricks on the thread that asks: 3.0 million bricks and 228 s
+    // for the first view, and a second a metre while walking. It waits for streaming (#86, #49).
     store.build_lod(levels - 1);
     Ground {
         store,
@@ -154,7 +169,20 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         camera,
         ground,
     } = generate_ground(map, reach, RING_LEVELS);
-    let scene = planet_scene(&store, camera.position, planet_gen::planet::MAX_RADIUS)?;
+    let selected = Instant::now();
+    let scene = planet_scene(
+        &store,
+        camera.position,
+        Bands::standard(f64::from(DEFAULT_BIAS)),
+        planet_gen::planet::MAX_RADIUS,
+    )?;
+    let bricks: Vec<usize> = (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect();
+    eprintln!(
+        "selected and packed {} bricks in {:.1?} (per level {bricks:?}, {:.1} MiB)",
+        bricks.iter().sum::<usize>(),
+        selected.elapsed(),
+        scene.used_bytes() as f64 / (1024.0 * 1024.0)
+    );
     eprintln!("planet ready after {:.1?}", started.elapsed());
     Ok(Loaded {
         store,
@@ -206,6 +234,8 @@ struct App {
     eyes: Option<([f64; 3], [f64; 3])>,
     /// The sun as an azimuth and an elevation, which the arrow keys turn.
     sun: (f32, f32),
+    /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
+    bias: f32,
     /// The title last set, so that it is only set when it changes.
     title: String,
     grabbed: bool,
@@ -251,6 +281,7 @@ impl App {
             spawn: None,
             eyes: None,
             sun: Sun::default().angles(),
+            bias: DEFAULT_BIAS,
             title: String::new(),
             grabbed: false,
             last_frame: Instant::now(),
@@ -382,6 +413,16 @@ impl App {
         self.show(update)
     }
 
+    /// Selects the bricks again for a LOD bias of `bias`, and copies the result to the GPU.
+    fn set_bias(&mut self, bias: f32) -> Result<(), Box<dyn Error>> {
+        self.bias = bias;
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        let update = world.set_bands(Bands::standard(f64::from(bias)))?;
+        self.show(update)
+    }
+
     /// Copies what changed in the Planet to the GPU.
     fn show(&mut self, update: Option<SceneUpdate>) -> Result<(), Box<dyn Error>> {
         if let (Some(update), Some(world), Some(renderer)) =
@@ -474,6 +515,7 @@ impl App {
             mode: renderer.mode(),
             debug_view: renderer.debug_view(),
             sun: self.sun,
+            bias: self.bias,
         };
         let mut controls = before;
         let info = overlay::Info {
@@ -484,6 +526,7 @@ impl App {
                 used: self.world.as_ref().map_or(0, |w| w.scene().used_bytes()),
                 allocated: renderer.scene_bytes(),
             },
+            lod: self.world.as_ref().and_then(|w| lod_info(w.scene())),
         };
         let input = gui.state.take_egui_input(window);
         let mut output = gui
@@ -499,6 +542,11 @@ impl App {
         }
         if controls.sun != before.sun {
             self.set_sun(controls.sun.0, controls.sun.1);
+        }
+        if controls.bias != before.bias
+            && let Err(err) = self.set_bias(controls.bias)
+        {
+            self.error = Some(err);
         }
         Some(output)
     }
@@ -525,6 +573,17 @@ impl App {
         }
         window.set_cursor_visible(!self.grabbed);
     }
+}
+
+/// What the overlay says of the LOD bands: where level 0 ends, in metres, and the bricks drawn at
+/// each level.
+fn lod_info(scene: &Scene) -> Option<LodInfo> {
+    let bands = scene.bands()?;
+    Some(LodInfo {
+        // Level 0 owns [0, 2 * d0) Voxels of 10 cm.
+        switch_m: bands.floor(1) * 0.1,
+        bricks: (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect(),
+    })
 }
 
 /// The azimuth wrapped into (-pi, pi], which is the range of the overlay's slider, and the
@@ -812,6 +871,7 @@ mod tests {
         let scene = planet_scene(
             &loaded.store,
             loaded.camera.position,
+            Bands::standard(1.0),
             planet_gen::planet::MAX_RADIUS,
         )
         .expect("a patch of the Planet fits the rings");
@@ -822,6 +882,7 @@ mod tests {
         let clipped = planet_scene(
             &loaded.store,
             loaded.camera.position,
+            Bands::standard(1.0),
             planet_gen::MAX_RADIUS,
         )
         .expect("a patch of the Planet fits the rings");

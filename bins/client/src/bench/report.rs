@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::budget::{Budgets, Status, status};
 use super::stats::Stats;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -35,6 +35,39 @@ pub struct ModeReport {
     /// CPU time to draw one frame of the path and read the image back; in reference mode, a
     /// frame is all of its samples.
     pub frame_time: Stats,
+    /// CPU time per frame to follow the camera with the Planet: select the bricks the LOD bands
+    /// ask for, pack the ones that changed, and hand them to the GPU. It is done before the
+    /// frame is timed, so it is in no pass and not in `frame_time`.
+    pub scene_update_ms: Stats,
+    /// What the bands selected at each keyframe of the path. Empty for a scene that is not
+    /// drawn in levels (`--short`).
+    pub lod_at_keyframes: Vec<KeyframeLod>,
+}
+
+/// A still camera at one height above the test Planet: the times of the passes there, and the
+/// bricks the bands select for it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Altitude {
+    /// Above the Planet's mean radius, in metres.
+    pub height_m: f64,
+    /// Bricks drawn at each level, level 0 first.
+    pub bricks: Vec<usize>,
+    /// The `primary` and `upscale` passes of primary mode, and the `reference` pass of reference
+    /// mode (one sample): no budget is held against them.
+    pub primary: Stats,
+    pub upscale: Stats,
+    pub reference: Stats,
+}
+
+/// The bricks drawn at each level of detail from one keyframe of the path.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KeyframeLod {
+    /// The frame of the run the camera is at the keyframe.
+    pub frame: u32,
+    /// How high the camera is above the Planet's mean radius, in metres.
+    pub height_m: f64,
+    /// Bricks drawn at each level, level 0 first.
+    pub bricks: Vec<usize>,
 }
 
 /// The times that one mode's measured frames recorded, as the GPU timers kept them.
@@ -46,6 +79,9 @@ pub struct Measured<'a> {
     pub passes: Vec<(String, &'a [f64])>,
     pub gpu_total: &'a [f64],
     pub wall: &'a [f64],
+    /// CPU milliseconds to follow the camera, for each frame.
+    pub scene_update: &'a [f64],
+    pub lod_at_keyframes: Vec<KeyframeLod>,
 }
 
 fn entry(name: &str, times: &[f64], budget_ms: Option<f64>) -> Entry {
@@ -75,6 +111,8 @@ pub fn mode_report(mode: &str, measured: &Measured, budgets: &Budgets) -> ModeRe
             budgets.gpu_total.get(mode).copied(),
         ),
         frame_time: Stats::of(measured.wall),
+        scene_update_ms: Stats::of(measured.scene_update),
+        lod_at_keyframes: measured.lod_at_keyframes.clone(),
     }
 }
 
@@ -171,6 +209,8 @@ pub struct Config {
     /// The camera path, which has a version in its name: the same name is the same flight.
     pub path: String,
     pub keyframes: usize,
+    /// The LOD bias: output pixels one Voxel may cover (`--bias`).
+    pub bias: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -187,6 +227,9 @@ pub struct Report {
     pub machine: Machine,
     pub config: Config,
     pub modes: Modes,
+    /// The Planet from a still camera at several heights, one after the other, after the flight;
+    /// empty for `--short`.
+    pub altitudes: Vec<Altitude>,
     /// File names, in the output folder.
     pub screenshots: Vec<String>,
     pub budgets: BudgetSummary,
@@ -211,6 +254,12 @@ mod tests {
             passes,
             gpu_total: total,
             wall: &[16.0, 18.0],
+            scene_update: &[2.0, 4.0],
+            lod_at_keyframes: vec![KeyframeLod {
+                frame: 0,
+                height_m: 12.5,
+                bricks: vec![10, 0, 4],
+            }],
         }
     }
 
@@ -240,6 +289,8 @@ mod tests {
         assert_eq!(report.gpu_total.stats.mean_ms, Some(1.5));
         assert_eq!(report.gpu_total.budget_ms, Some(8.6));
         assert_eq!(report.frame_time.mean_ms, Some(17.0));
+        assert_eq!(report.scene_update_ms.mean_ms, Some(3.0));
+        assert_eq!(report.lod_at_keyframes[0].bricks, [10, 0, 4]);
     }
 
     #[test]
@@ -326,8 +377,16 @@ mod tests {
                 scene: "patch".into(),
                 path: "flyover".into(),
                 keyframes: 3,
+                bias: 1.0,
             },
             modes: modes(0.5),
+            altitudes: vec![Altitude {
+                height_m: 100.0,
+                bricks: vec![5, 6],
+                primary: Stats::of(&[0.2, 0.4]),
+                upscale: Stats::of(&[0.1]),
+                reference: Stats::of(&[1.0]),
+            }],
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5)),
         };
@@ -338,6 +397,7 @@ mod tests {
         assert_eq!(
             keys(&json),
             [
+                "altitudes",
                 "budgets",
                 "build",
                 "config",
@@ -347,7 +407,7 @@ mod tests {
                 "screenshots"
             ]
         );
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
         let pass = &json["modes"]["primary"]["passes"][0];
@@ -371,7 +431,9 @@ mod tests {
                 "frame_time",
                 "frames",
                 "gpu_total",
+                "lod_at_keyframes",
                 "passes",
+                "scene_update_ms",
                 "spp",
                 "warmup_frames"
             ]

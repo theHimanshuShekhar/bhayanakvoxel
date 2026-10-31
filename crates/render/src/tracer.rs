@@ -60,7 +60,7 @@ struct SceneHeader {
 impl SceneHeader {
     fn new(scene: &Scene) -> Self {
         let mut header = SceneHeader::zeroed();
-        header.level_count = scene.levels.len() as u32;
+        header.level_count = scene.walked_levels() as u32;
         if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
             header.bound_radius = radius;
             header.bound_centre = bound.centre;
@@ -327,6 +327,18 @@ fn write_words(queue: &wgpu::Queue, buffer: &wgpu::Buffer, words: &[u32], at: us
     words.len() as u64 * 4
 }
 
+/// The runs of consecutive numbers in `sorted` (ascending, no repeats), each as a range.
+fn runs(sorted: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for &n in sorted {
+        match out.last_mut() {
+            Some(last) if last.end == n => last.end += 1,
+            _ => out.push(n..n + 1),
+        }
+    }
+    out
+}
+
 /// The Planet's packed bricks on the GPU. The buffers of an ordinary scene have room to grow,
 /// since an Edit appends to `brick_refs` and `bricks` (see [`Scene::update`]); those of rings
 /// are as big as the scene's, which has all its room already.
@@ -587,22 +599,20 @@ impl Tracer {
                     queue.write_buffer(&buffers.header, 0, bytemuck::bytes_of(&header));
                     written += size_of::<SceneHeader>() as u64;
                 }
-                for &slot in &patch.table {
+                // Each write is a copy on the GPU with its own barrier, and a patch is mostly slots
+                // and records that are next to each other (they are handed out in order), so those
+                // go in as runs.
+                for run in runs(&patch.table) {
                     written += write_words(
                         queue,
                         &buffers.table,
-                        &scene.table[slot * 4..][..4],
-                        slot * 4,
+                        &scene.table[run.start * 4..run.end * 4],
+                        run.start * 4,
                     );
                 }
-                for &region in &patch.regions {
-                    let at = region * REGION_WORDS;
-                    written += write_words(
-                        queue,
-                        &buffers.regions,
-                        &scene.regions[at..][..REGION_WORDS],
-                        at,
-                    );
+                for run in runs(&patch.regions) {
+                    let (from, to) = (run.start * REGION_WORDS, run.end * REGION_WORDS);
+                    written += write_words(queue, &buffers.regions, &scene.regions[from..to], from);
                 }
                 for (buffer, words, ranges) in [
                     (&buffers.brick_refs, &scene.brick_refs, &patch.brick_refs),

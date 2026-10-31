@@ -21,6 +21,7 @@ pub mod accumulation;
 pub mod camera;
 mod debug_view;
 mod gpu_materials;
+pub mod lod;
 mod offscreen;
 pub mod overlay;
 mod profiler;

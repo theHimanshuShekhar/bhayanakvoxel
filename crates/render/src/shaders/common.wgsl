@@ -69,9 +69,9 @@ fn hash_voxel(cell: vec3<i32>) -> u32 {
 
 // The Material's colour at `voxel`: its base colour with the hue and brightness turned by up to
 // the Material's jitter, by an amount that depends only on the patch of `noise_scale` Voxels
-// that `voxel` is in. `strength` (0..1) scales the jitter down; 0 is the base colour. There is no
-// colour stored per Voxel: this is a function of the Voxel's position alone.
-fn varied_albedo(material: u32, voxel: vec3<i32>, strength: f32) -> vec3<f32> {
+// that `voxel` is in. There is no colour stored per Voxel: this is a function of the Voxel's
+// position alone, and it does not change with distance.
+fn varied_albedo(material: u32, voxel: vec3<i32>) -> vec3<f32> {
     let base = albedo(material);
     if !is_known(material) {
         return base;
@@ -82,10 +82,10 @@ fn varied_albedo(material: u32, voxel: vec3<i32>, strength: f32) -> vec3<f32> {
     let value = f32(h & 255u) / 255.0 * 2.0 - 1.0;
     let hue = f32((h >> 8u) & 255u) / 255.0 * 2.0 - 1.0;
     // Turn the colour about the grey axis (Rodrigues' rotation) for the hue.
-    let angle = hue * params.y * strength;
+    let angle = hue * params.y;
     let axis = vec3<f32>(0.57735027);
     let turned = base * cos(angle) + cross(axis, base) * sin(angle) + axis * dot(axis, base) * (1.0 - cos(angle));
-    return max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z * strength);
+    return max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z);
 }
 
 // A simple gradient from the horizon to the zenith, until the atmosphere replaces it. It uses

@@ -95,6 +95,8 @@ pub struct Offscreen {
     profiler: Profiler,
     target: Target,
     sun: Sun,
+    /// Whether `update_scene` sends its writes at once; see `set_flush_scene_updates`.
+    flush_scene_updates: bool,
 }
 
 impl Offscreen {
@@ -136,6 +138,7 @@ impl Offscreen {
             profiler,
             target,
             sun: Sun::default(),
+            flush_scene_updates: true,
         })
     }
 
@@ -143,7 +146,19 @@ impl Offscreen {
     /// [`Scene::update`]) changed it. This starts the reference image over.
     pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
         self.tracer
-            .update_scene(&self.device, &self.queue, scene, update)
+            .update_scene(&self.device, &self.queue, scene, update)?;
+        // The writes are queued until the next submit: send them now, so that their cost is the
+        // update's and not that of the frame drawn next.
+        if self.flush_scene_updates {
+            self.queue.submit(std::iter::empty());
+        }
+        Ok(())
+    }
+
+    /// Whether [`Offscreen::update_scene`] sends the writes to the GPU at once (the default), or
+    /// leaves them to go with the next frame's commands. For finding out what the first costs.
+    pub fn set_flush_scene_updates(&mut self, flush: bool) {
+        self.flush_scene_updates = flush;
     }
 
     /// Changes the sun that both ways of rendering light the Planet with.

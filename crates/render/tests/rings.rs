@@ -1,7 +1,9 @@
-//! The test Planet in rings (`Scene::rings`), at every distance from the surface to orbit: that
-//! the GPU and the CPU walk them alike, that they show no cracks and match the approved golden
-//! images, that moving the camera moves them without writing what stays, and that the GPU memory
-//! they take does not grow. Needs a Vulkan device (lavapipe in CI).
+//! The test Planet in rings (`Scene::rings`), each brick at the level its distance from the camera
+//! says (the LOD bands), at every distance from the surface to orbit: that the GPU and the CPU
+//! walk them alike, that they show no cracks and match the approved golden images, that the
+//! surface moves by under a pixel where the level changes, that moving the camera writes only
+//! what changes, and that the GPU memory they take stays bounded. Needs a Vulkan device
+//! (lavapipe in CI).
 //!
 //! The whole Planet takes about half a minute to generate, so the tests share one.
 
@@ -11,13 +13,14 @@ use std::sync::OnceLock;
 
 use brick_store::BrickStore;
 use common::{Lcg, PRIMARY, assert_agree, check_golden, ray};
+use render::lod::Bands;
 use render::reference::{Hit, Ray, trace};
 use render::scene::{Bound, Core};
 use render::{Camera, Image, Offscreen, Scene, SceneUpdate};
 
 const SEED: u64 = 0xB4A7_A9AC;
-/// Rings of the Planet: as many as the client draws.
-const LEVELS: usize = 7;
+/// Levels of the Planet's pyramid: as many as the client draws (0 to 12).
+const LEVELS: usize = render::lod::LEVELS;
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
 
@@ -31,8 +34,28 @@ fn planet() -> &'static BrickStore {
     })
 }
 
+/// The Planet's bounding ball, as the client gives it to the scene.
+fn ball() -> Bound {
+    Bound {
+        centre: [0; 3],
+        radius: planet_gen::MAX_RADIUS,
+    }
+}
+
+fn rings_with(camera: [f64; 3], bands: Bands) -> Scene {
+    Scene::rings(planet(), camera, bands, ball()).unwrap()
+}
+
+/// The strict rule at 1440p output and a 70 degree field of view: a level 0 Voxel is a pixel
+/// at 102.8 m.
 fn rings_at(camera: [f64; 3]) -> Scene {
-    Scene::rings(planet(), camera, LEVELS).unwrap()
+    rings_with(camera, Bands::standard(1.0))
+}
+
+/// `scene` without its bounding ball, so that rays are not clipped to it.
+fn unclipped(mut scene: Scene) -> Scene {
+    scene.bound = None;
+    scene
 }
 
 /// Where the camera is and what it looks at, for the views that are at the surface, at the
@@ -148,41 +171,205 @@ fn no_ray_gets_through_to_the_sky_where_the_whole_planet_has_ground() {
 }
 
 #[test]
-fn every_ring_holds_about_as_many_bricks() {
-    // From the surface, where the Planet's surface crosses every ring that is smaller than it.
-    let scene = rings_at(SURFACE.0);
-    let bricks: Vec<usize> = (0..3).map(|level| scene.level_bricks(level)).collect();
-    let most = *bricks.iter().max().unwrap();
+fn bricks_are_selected_by_level_where_the_bands_say_and_the_bias_changes_them() {
+    // From the surface most of the test Planet is within 2 * d0 of the camera: level 0. From
+    // orbit it is far, and the levels in use are coarse.
+    let near = rings_at(SURFACE.0);
+    assert!(near.level_bricks(0) > 10_000);
+    // The far side is over 2 * d0 (2056 Voxels) away, and under 4 * d0.
+    let counts: Vec<usize> = (0..LEVELS).map(|l| near.level_bricks(l)).collect();
+    eprintln!("surface bricks per level {counts:?}");
     assert!(
-        bricks.iter().all(|&b| 2 * b > most),
-        "bricks in the first three rings: {bricks:?}"
+        near.level_bricks(1) > 0 && near.level_bricks(2) == 0,
+        "{counts:?}"
     );
-    // The buffers are the same size wherever the camera is: what bounds the GPU memory.
-    let size = |s: &Scene| s.table.len() + s.regions.len() + s.brick_refs.len() + s.bricks.len();
-    assert_eq!(size(&scene), size(&rings_at(ORBIT.0)));
+    let far = rings_at(ORBIT.0);
+    let used: Vec<_> = (0..LEVELS).filter(|&l| far.level_bricks(l) > 0).collect();
+    eprintln!("orbit uses levels {used:?}");
+    assert!(!used.is_empty());
+    // A bias of 2 halves every switch distance: the same view uses coarser levels, and fewer
+    // bricks.
+    let loose = rings_with(ORBIT.0, Bands::standard(2.0));
+    let bricks = |s: &Scene| (0..LEVELS).map(|l| s.level_bricks(l)).sum::<usize>();
+    assert!(
+        bricks(&loose) < bricks(&far),
+        "{} {}",
+        bricks(&loose),
+        bricks(&far)
+    );
+    // 2200 Voxels from the surface level 1 has begun with a bias of 1 (it starts at 2056), but
+    // not with a bias of 2, where level 0 has ended at 1028.
+    let view = [0.0, f64::from(planet_gen::MAX_RADIUS) + 2200.0, 250.0];
+    assert!(rings_at(view).level_bricks(1) > 0);
+    assert_eq!(rings_with(view, Bands::standard(2.0)).level_bricks(0), 0);
+    assert!(rings_with(view, Bands::standard(2.0)).level_bricks(2) > 0);
+}
+
+/// Camera positions straight above the Planet's +y pole, at the switch distances of levels 1
+/// to 6 (from the surface's highest point), and just either side of them.
+fn switch_cameras(bias: f64) -> Vec<(usize, [f64; 3])> {
+    let d0 = Bands::standard(bias).d0();
+    let top = f64::from(planet_gen::MAX_RADIUS);
+    (1..=6)
+        .flat_map(|level| {
+            let at = d0 * (1u64 << level) as f64;
+            [0.97, 1.0, 1.03]
+                .into_iter()
+                .map(move |k| (level, [0.0, top + at * k, 0.0]))
+        })
+        .collect()
+}
+
+/// Rays from `camera` at the cap of the Planet that faces it.
+fn rays_at_the_disc(camera: [f64; 3], count: usize, rng: &mut Lcg) -> Vec<Ray> {
+    let distance = camera.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let to_camera = camera.map(|c| c / distance);
+    // Two unit vectors across the direction to the camera.
+    let across = if to_camera[0].abs() < 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let dot: f64 = (0..3).map(|a| across[a] * to_camera[a]).sum();
+    let u: [f64; 3] = std::array::from_fn(|a| across[a] - to_camera[a] * dot);
+    let len = u.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let u = u.map(|c| c / len);
+    let w = [
+        to_camera[1] * u[2] - to_camera[2] * u[1],
+        to_camera[2] * u[0] - to_camera[0] * u[2],
+        to_camera[0] * u[1] - to_camera[1] * u[0],
+    ];
+    (0..count)
+        .map(|_| {
+            // A point of the cap that faces the camera, within 40 degrees of its pole.
+            let (r, v) = (f64::from(rng.next()), f64::from(rng.next()));
+            let angle = 0.7 * r.sqrt();
+            let turn = v * std::f64::consts::TAU;
+            let on: [f64; 3] = std::array::from_fn(|a| {
+                to_camera[a] * angle.cos() + (u[a] * turn.cos() + w[a] * turn.sin()) * angle.sin()
+            });
+            let radius = 1400.0 + 160.0 * f64::from(rng.next());
+            ray(camera, on.map(|c| c * radius))
+        })
+        .collect()
+}
+
+/// No ray that hits the Planet at level 0 misses it after the bands have chosen the levels, at
+/// every switch distance and a hair either side of it, nor does it with a bias of 2: the bands
+/// partition space, so a level boundary can open no gap.
+#[test]
+fn rays_that_hit_at_level_0_still_hit_after_selection_at_every_switch_distance() {
+    let truth = whole_planet();
+    let mut rng = Lcg(5150);
+    for bias in [1.0, 2.0] {
+        for (level, camera) in switch_cameras(bias) {
+            let scene = rings_with(camera, Bands::standard(bias));
+            let (mut hits, mut through) = (0, 0);
+            for ray in rays_at_the_disc(camera, 400, &mut rng) {
+                let want = trace(&truth, &ray);
+                hits += usize::from(want.is_some());
+                through += usize::from(want.is_some() && trace(&scene, &ray).is_none());
+            }
+            assert!(hits > 100, "level {level}: {hits} hits");
+            assert_eq!(through, 0, "bias {bias}, level {level}, camera {camera:?}");
+        }
+    }
+}
+
+/// How far the surface moves where a level takes over: for rays that hit both the whole Planet
+/// at level 0 and the bands' selection, the difference of the distances along the ray, in
+/// output pixels (a Voxel of size 1 covers one pixel at `t` of `f_out`, so a distance of `d`
+/// Voxels covers `d * f_out / t` of them).
+fn displacements(bias: f64, held: bool, rng: &mut Lcg) -> Vec<(usize, Vec<f64>)> {
+    let truth = whole_planet();
+    let bands = Bands::standard(bias);
+    let focal = bands.d0() * bias;
+    let top = f64::from(planet_gen::MAX_RADIUS);
+    (1..=6)
+        .map(|level| {
+            // The nearest surface is at the inner edge of the level's band: as near as a fresh
+            // selection goes. With `held`, the camera came in from further out, and the bricks
+            // stay at their level down to 0.95 of the distance (the hysteresis): as near as any
+            // brick goes.
+            let (from, to) = if held {
+                (bands.floor(level) * 1.06, bands.floor(level) * 0.951)
+            } else {
+                (bands.floor(level) * 1.001, bands.floor(level) * 1.001)
+            };
+            let mut scene = rings_with([0.0, top + from, 0.0], bands);
+            let camera = [0.0, top + to, 0.0];
+            if held {
+                // In steps that are patches, not jumps that make the scene again (see `JUMP`),
+                // so that the bricks are the ones that stayed at their level on the way in.
+                let step = bands.d0();
+                let distance = from - to;
+                let steps = (distance / step).ceil() as u32;
+                for i in 1..=steps {
+                    let at = from - distance * f64::from(i) / f64::from(steps);
+                    let update = scene.recentre(planet(), [0.0, top + at, 0.0]).unwrap();
+                    assert_ne!(update, Some(SceneUpdate::Rebuilt), "level {level}");
+                }
+            }
+            let mut errors = Vec::new();
+            for ray in rays_at_the_disc(camera, 1500, rng) {
+                let (Some(want), Some(got)) = (trace(&truth, &ray), trace(&scene, &ray)) else {
+                    continue;
+                };
+                errors.push(f64::from((want.t - got.t).abs()) * focal / f64::from(want.t));
+            }
+            (level, errors)
+        })
+        .collect()
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    sorted[((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1]
+}
+
+/// The surface at the switch distance is within a pixel of the Voxels of level 0 for 95% of rays
+/// (the catalogue's gate, #81): measured, and printed for the report, with the worst ray. A fresh
+/// selection switches at the boundary itself; the hysteresis lets a brick stay at its level down
+/// to 0.95 of it, where its Voxels are a twentieth of a pixel bigger, so that is measured too: the
+/// camera comes in from 1.06 times the boundary in steps that patch the scene (it would make it
+/// again for a jump), and p95 is under a pixel at every level either way. The worst ray is not:
+/// 1.7 px fresh and 4.3 px held, at level 1.
+#[test]
+fn the_surface_moves_by_under_a_pixel_at_the_switch_distances() {
+    let mut rng = Lcg(81);
+    for held in [false, true] {
+        for (level, mut errors) in displacements(1.0, held, &mut rng) {
+            assert!(errors.len() > 400, "level {level}: {} rays", errors.len());
+            errors.sort_by(f64::total_cmp);
+            let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+            let (p95, max) = (percentile(&errors, 0.95), errors[errors.len() - 1]);
+            eprintln!(
+                "{} level {level}: displacement {mean:.2} px mean, {p95:.2} p95, {max:.2} max ({} rays)",
+                if held { "at 0.95" } else { "at 1.00" },
+                errors.len()
+            );
+            let limit = 1.0;
+            assert!(p95 <= limit, "level {level}: p95 is {p95:.2} px");
+        }
+    }
 }
 
 #[test]
-fn moving_the_camera_moves_the_rings_without_writing_the_bricks_that_stay() {
-    let (start, end) = ([0.0, 1548.0, 200.0], [0.0, 1548.0, 450.0]);
+fn moving_the_camera_writes_only_what_changes() {
+    // Two thousand Voxels above the pole, where the band of level 1 starts: a short move brings
+    // bricks into it and out of it, and leaves the rest alone.
+    let start = [0.0, 1548.0 + 2000.0, 200.0];
+    let end = [0.0, 1548.0 + 2000.0, 330.0];
     let mut scene = rings_at(start);
     let mut gpu = Offscreen::new(WIDTH, HEIGHT, &scene).unwrap();
     let whole = gpu.uploaded_bytes();
     assert_eq!(whole, gpu.scene_bytes());
 
-    // Still within the middle of the boxes: nothing is written.
-    assert!(
-        scene
-            .recentre(planet(), [0.0, 1548.0, 210.0])
-            .unwrap()
-            .is_none()
-    );
+    // Not moved: nothing is written.
+    assert!(scene.recentre(planet(), start).unwrap().is_none());
     assert_eq!(gpu.uploaded_bytes(), whole);
 
-    // A few regions on: the regions that come into the boxes are packed and written, and the
-    // bricks of those that stay are not.
     let Some(update) = scene.recentre(planet(), end).unwrap() else {
-        panic!("the rings move");
+        panic!("the bands move");
     };
     let SceneUpdate::Rings(patch) = &update else {
         panic!("the rings are patched: {update:?}");
@@ -191,17 +378,17 @@ fn moving_the_camera_moves_the_rings_without_writing_the_bricks_that_stay() {
     let written = gpu.uploaded_bytes() - whole;
     let words = patch.words() as u64 * 4;
     assert!(
-        (words..words + 2048).contains(&written),
+        (words..words + 4096).contains(&written),
         "{written} bytes written for a patch of {words}"
     );
     assert!(
-        written * 20 < gpu.scene_bytes(),
+        written * 4 < gpu.scene_bytes(),
         "{written} bytes written of {}",
         gpu.scene_bytes()
     );
 
-    // And what is drawn is what the same rings built from scratch draw.
-    let camera = Camera::looking_at(end, [0.0, 1535.0, -300.0]);
+    // And what is drawn is what the same selection packed from scratch draws.
+    let camera = Camera::looking_at(end, [0.0; 3]);
     let fresh = Offscreen::new(WIDTH, HEIGHT, &scene.rebuilt_rings(planet()).unwrap())
         .unwrap()
         .render(&camera);
@@ -213,8 +400,7 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
     let (low, high) = ([0.0, 1548.0, 250.0], [0.0, 3600.0, 3000.0]);
     let mut scene = rings_at(low);
     let mut gpu = Offscreen::new(64, 36, &scene).unwrap();
-    let bytes = gpu.scene_bytes();
-    let (mut written, mut moves, mut worst) = (0, 0, 0);
+    let (mut written, mut moves, mut rebuilt, mut peak) = (0, 0, 0, gpu.scene_bytes());
     let steps = 60;
     for step in 0..=2 * steps {
         // Up in a straight line, and down again.
@@ -222,14 +408,13 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
         let at: [f64; 3] = std::array::from_fn(|a| low[a] + (high[a] - low[a]) * t);
         let before = gpu.uploaded_bytes();
         if let Some(update) = scene.recentre(planet(), at).unwrap() {
+            rebuilt += usize::from(update == SceneUpdate::Rebuilt);
             gpu.update_scene(&scene, &update).unwrap();
             moves += 1;
         }
-        let step_bytes = gpu.uploaded_bytes() - before;
-        written += step_bytes;
-        worst = worst.max(step_bytes);
-        assert_eq!(gpu.scene_bytes(), bytes, "step {step}");
-        // What the camera sees from here is what rings built here show, now and then.
+        written += gpu.uploaded_bytes() - before;
+        peak = peak.max(gpu.scene_bytes());
+        // What the camera sees from here is what the same selection packed from scratch shows.
         if step % 30 == 0 {
             let camera = Camera::looking_at(at, [0.0; 3]);
             let fresh = Offscreen::new(64, 36, &scene.rebuilt_rings(planet()).unwrap())
@@ -238,13 +423,11 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
             assert_eq!(gpu.render(&camera), fresh, "step {step} at {at:?}");
         }
     }
-    assert!(moves > 40, "the rings moved {moves} times");
-    // The GPU memory is the same all the way, and is a fraction of the budget. No step writes
-    // more than a fraction of it, so nothing is packed again from scratch; the whole flight
-    // writes it a few times over.
-    assert!(bytes < 128 << 20, "{bytes} bytes of GPU memory");
-    assert!(worst * 4 < bytes, "a step wrote {worst} bytes of {bytes}");
-    assert!(written < 8 * bytes, "{written} bytes written, of {bytes}");
+    eprintln!("{moves} moves, {rebuilt} rebuilds, {written} bytes written, peak {peak}");
+    assert!(moves > 20, "the rings moved {moves} times");
+    assert!(rebuilt <= 4, "packed again {rebuilt} times");
+    // Under the budget (~2 GB), and by far.
+    assert!(peak < 512 << 20, "{peak} bytes of GPU memory");
 }
 
 /// What the walk costs, in steps (see `reference::Steps`), averaged over a fan of primary rays
@@ -399,24 +582,12 @@ fn flyover_cost(mut scene: Scene, rings: bool) -> [[Cost; 4]; 3] {
     costs
 }
 
-/// The Planet's bounding ball, as the client gives it to the scene.
-fn ball() -> Option<Bound> {
-    Some(Bound {
-        centre: [0; 3],
-        radius: planet_gen::MAX_RADIUS,
-    })
-}
-
-fn bounded(mut scene: Scene) -> Scene {
-    scene.bound = ball();
-    scene
-}
-
 #[test]
-fn the_rings_walk_about_as_many_steps_as_a_single_level_scene_along_the_bench_flight() {
+fn the_bands_walk_about_as_many_steps_as_a_single_level_scene_along_the_bench_flight() {
     let single = flyover_cost(whole_planet(), false);
-    let unclipped = flyover_cost(rings_at(flyover_camera(0, 240).position), true);
-    let rings = flyover_cost(bounded(rings_at(flyover_camera(0, 240).position)), true);
+    let start = flyover_camera(0, 240).position;
+    let unclipped = flyover_cost(unclipped(rings_at(start)), true);
+    let rings = flyover_cost(rings_at(start), true);
     for (kind, name) in ["primary", "shadow", "bounce"].iter().enumerate() {
         for (class, what) in ["sky", "ground", "grazing", "all"].iter().enumerate() {
             let (a, u, b) = (
@@ -454,9 +625,9 @@ fn the_rings_walk_about_as_many_steps_as_a_single_level_scene_along_the_bench_fl
             b.total(),
             a.total()
         );
-        // And they look at few levels: a ray that is clipped away, or that hits, stops there.
+        // And they look at few levels: only those that list anything are walked at all.
         assert!(
-            b.mean()[0] < 3.0,
+            b.mean()[0] < 4.0,
             "{name}: looks at {} levels a ray",
             b.mean()[0]
         );
@@ -473,8 +644,8 @@ fn clipping_to_the_bounding_ball_changes_no_image() {
                 .unwrap()
                 .render(&camera)
         };
-        let plain = rings_at(view.0);
-        let clipped = bounded(rings_at(view.0));
+        let plain = unclipped(rings_at(view.0));
+        let clipped = rings_at(view.0);
         assert_eq!(draw(&plain), draw(&clipped), "{view:?}");
         // The CPU walk agrees with itself too: the same Voxel, face and Material, and the
         // distance to a rounding (a region is entered where the clip began the walk, or by
@@ -528,17 +699,16 @@ const FAR_CAMERAS: [[f64; 3]; 6] = [
     [1000.0, -9000.0, 500.0],
 ];
 
-/// The ball does not cut into Voxels of the coarse rings, which are drawn whole and stick out of
-/// it by their diagonal, not even at the limb. Without the ball a ring of 64-Voxel cubes is met
-/// out to about 110 Voxels beyond the finest Voxels' greatest radius.
+/// The ball does not cut into Voxels of the coarse levels, which are drawn whole and stick out of
+/// it by their diagonal, not even at the limb. The clip allows for the coarsest level drawn.
 #[test]
 fn clipping_to_the_bounding_ball_does_not_cut_into_coarse_voxels_at_the_limb() {
     let outermost = f64::from(planet_gen::MAX_RADIUS);
     let mut rng = Lcg(808);
     let (mut rays_in_all, mut sticking_out, mut off_by_an_edge) = (0, 0, 0);
     for camera in FAR_CAMERAS {
-        let plain = rings_at(camera);
-        let clipped = bounded(rings_at(camera));
+        let plain = unclipped(rings_at(camera));
+        let clipped = rings_at(camera);
         let (cell, origin) = render::camera::split(camera);
         let mut rays = limb_rays(camera, 4000, &mut rng);
         rays.push(Ray {
@@ -574,10 +744,9 @@ fn clipping_to_the_bounding_ball_does_not_cut_into_coarse_voxels_at_the_limb() {
     eprintln!(
         "{rays_in_all} rays, {sticking_out} hits beyond the ball, {off_by_an_edge} on an edge"
     );
-    assert!(
-        sticking_out > 100,
-        "only {sticking_out} hits beyond the ball"
-    );
+    // The bands keep a Voxel under a pixel across, so only the coarse levels far out stick out
+    // of the ball by much; there must be some, or the test proves nothing.
+    assert!(sticking_out > 0, "no hits beyond the ball");
     assert!(
         off_by_an_edge * 500 < rays_in_all,
         "{off_by_an_edge} of {rays_in_all}"
@@ -588,7 +757,7 @@ fn clipping_to_the_bounding_ball_does_not_cut_into_coarse_voxels_at_the_limb() {
 fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
     let mut rng = Lcg(404);
     for camera in CAMERAS {
-        let scene = bounded(rings_at(camera));
+        let scene = rings_at(camera);
         let mut rays = rays_at_the_planet(camera, 300, &mut rng);
         // Rays that pass the ball and rays that start in it, pointing every way.
         for _ in 0..200 {
@@ -605,8 +774,65 @@ fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
     }
     // And at the limb from far out, where coarse Voxels are what is hit.
     for camera in FAR_CAMERAS {
-        let scene = bounded(rings_at(camera));
+        let scene = rings_at(camera);
         let rays = limb_rays(camera, 400, &mut rng);
         assert_agree(&format!("ball limb, camera {camera:?}"), &rays, &scene);
+    }
+}
+
+/// What following the bench's flight costs the CPU, frame by frame: `Scene::recentre` along
+/// `planet-flyover-v1` (240 frames), after the first frame's scene was made, and then the jump from
+/// the end of the path back to its start, which is what the bench's warm-up does. Run in release:
+/// `cargo t --release -p render --test rings -- --ignored --nocapture flight_cpu_cost`.
+#[test]
+#[ignore = "a measurement, for a release build"]
+fn flight_cpu_cost() {
+    use std::time::Instant;
+    let first = flyover_camera(0, 240).position;
+    let built = Instant::now();
+    let mut scene = rings_at(first);
+    eprintln!("first scene: {:.1?}", built.elapsed());
+    let (mut times, mut words, mut rebuilt) = (Vec::new(), 0usize, 0);
+    for frame in 1..240 {
+        let at = flyover_camera(frame, 240).position;
+        let started = Instant::now();
+        let update = scene.recentre(planet(), at).unwrap();
+        times.push(started.elapsed().as_secs_f64() * 1e3);
+        match update {
+            Some(SceneUpdate::Rings(patch)) => words += patch.words(),
+            Some(SceneUpdate::Rebuilt) => rebuilt += 1,
+            _ => {}
+        }
+    }
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    eprintln!(
+        "flight: mean {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}; {} KiB patched in all, {rebuilt} rebuilds",
+        times.iter().sum::<f64>() / times.len() as f64,
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() * 95 / 100],
+        sorted[sorted.len() - 1],
+        words * 4 / 1024
+    );
+    // Jumps of several sizes from the first camera: patched where the camera goes, and a new
+    // scene made there.
+    let start = flyover_camera(0, 240).position;
+    for jump in [100.0, 300.0, 1000.0, 2000.0, 4000.0, 8000.0] {
+        let mut scene = rings_at(start);
+        let to = [start[0] + jump, start[1], start[2]];
+        let started = Instant::now();
+        let update = scene.recentre(planet(), to).unwrap();
+        let moved = started.elapsed();
+        let started = Instant::now();
+        let _ = rings_at(to);
+        eprintln!(
+            "jump of {jump:6}: {moved:8.1?} ({}), a new scene there {:.1?}",
+            match update {
+                Some(SceneUpdate::Rebuilt) => "rebuilt",
+                Some(_) => "patched",
+                None => "nothing",
+            },
+            started.elapsed()
+        );
     }
 }

@@ -26,23 +26,11 @@ fn face_code(hit: Hit) -> u32 {
     return 1u + 2u * axis + select(0u, 1u, along > 0.0);
 }
 
-// Far away, one pixel covers many Voxels whose faces point every which way, so the face normal
-// is noise, and so is their variation in colour. The rings of coarser levels (see scene.rs) make
-// the Voxels bigger with distance, which keeps them from being many to a pixel, but their faces
-// still point every which way: blend towards the direction away from the Planet's centre, and
-// towards the Material's plain colour, as the hit gets further than FAR_BLEND_START Voxels from
-// the camera.
-const FAR_BLEND_START = 100.0;
-const FAR_BLEND_END = 1500.0;
-
-// How far the hit is into the blend described above, 0 to 1.
-fn far_blend(hit: Hit) -> f32 {
-    return smoothstep(FAR_BLEND_START, FAR_BLEND_END, hit.t);
-}
-
-// The colour of the hit's surface, which is not lit yet.
+// The colour of the hit's surface, which is not lit yet. Voxels are never more than about a pixel
+// across (the LOD bands, see lod.rs), so the Voxel's own normal and colour variation are drawn at
+// every distance; there is no blending towards the Planet's radial direction or a plain colour.
 fn surface_albedo(hit: Hit) -> vec3<f32> {
-    return varied_albedo(hit.material, hit.voxel, 1.0 - far_blend(hit));
+    return varied_albedo(hit.material, hit.voxel);
 }
 
 // The light leaving the hit, towards the camera; `colour` is its surface_albedo.
@@ -50,9 +38,7 @@ fn shade(ray: Ray, hit: Hit, colour: vec3<f32>) -> vec3<f32> {
     if !hit.hit {
         return sky(ray.dir);
     }
-    let radial = normalize(vec3<f32>(hit.voxel) + 0.5);
-    let normal = normalize(mix(hit.normal, radial, far_blend(hit)));
-    let diffuse = max(dot(normal, normalize(frame.sun.xyz)), 0.0);
+    let diffuse = max(dot(hit.normal, normalize(frame.sun.xyz)), 0.0);
     return colour * (0.25 + 0.75 * diffuse) + emission(hit.material);
 }
 

@@ -3,10 +3,12 @@
 //! `shaders/trace.wgsl` is the one that ships; keep them in step.
 //!
 //! A scene is walked level by level, the finest first, and the nearest hit of all is the one.
-//! Level `n` has Voxels `2^n` times the size of level 0's, in a box (see
-//! [`Level`](crate::scene::Level)), and a level only counts outside the box of the level before
-//! it (the hole), so that every part of space is seen at one level only: finer near the camera
-//! and coarser far from it. Distances along the ray are in Voxels of level 0 at every level.
+//! Level `n` has Voxels `2^n` times the size of level 0's, and lists only the bricks that the
+//! LOD bands select for it (see [`crate::lod`]), so that every part of space is seen at one level
+//! only: finer near the camera and coarser far from it. A level is walked inside the box of
+//! regions it lists (see [`Level`](crate::scene::Level)), and not in its hole, the regions about
+//! the camera that none of its bricks reach. Distances along the ray are in Voxels of level 0 at
+//! every level.
 
 use std::cell::Cell;
 
@@ -336,19 +338,9 @@ fn hit_region(
     None
 }
 
-/// The first solid Voxel of mip `level` along the ray, in its box and outside the box of the
-/// level before it, if it is between `from` and `limit`. If the ray starts inside the box of the
-/// level before it and leaves it no nearer than `limit`, then so it does for every level after
-/// this one, and `done` is set.
-fn hit_level(
-    scene: &Scene,
-    ray: &Ray,
-    w: &Walk,
-    level: u32,
-    from: f32,
-    limit: f32,
-    done: &mut bool,
-) -> Option<Hit> {
+/// The first solid Voxel of mip `level` along the ray, in its box and outside its hole, if it is
+/// between `from` and `limit`.
+fn hit_level(scene: &Scene, ray: &Ray, w: &Walk, level: u32, from: f32, limit: f32) -> Option<Hit> {
     count(|s| s.examined += 1);
     let lv = &scene.levels[level as usize];
     let shift = 6 + level;
@@ -388,7 +380,6 @@ fn hit_level(
         t_enter = min3(h_far);
         normal = face(w, first_axis(h_far));
         if t_enter >= limit {
-            *done = max3(h_near) <= 0.0;
             return None;
         }
         // The ray may have left the regions that the level lists while it was in the hole.
@@ -411,7 +402,7 @@ fn hit_level(
             break;
         }
         count(|s| s.regions += 1);
-        // The regions of the hole are the finer level's.
+        // The regions of the hole have no brick of this level.
         if outside(rc, hole_first, hole_last)
             && let Some(region) = {
                 let (found, probes) = scene.find_region_probes(level as usize, rc);
@@ -470,30 +461,16 @@ pub fn trace(scene: &Scene, ray: &Ray) -> Option<Hit> {
         limit = along + h;
     }
 
-    // Every level is a part of space of its own, so the nearest hit of all is the first one.
-    // Once there is one, the levels beyond it only need looking at up to it.
+    // Every level is a part of space of its own, so the nearest hit of all is the one that is
+    // nearest: a ray that does not start at the camera meets the levels in any order. Once there
+    // is a hit, the levels after it only need looking at up to it.
     let mut nearest = None;
-    let mut done = false;
-    for level in 0..scene.levels.len() as u32 {
-        if done {
-            break;
-        }
-        if let Some(hit) = hit_level(scene, ray, &w, level, from, limit, &mut done)
+    for level in 0..scene.walked_levels() as u32 {
+        if let Some(hit) = hit_level(scene, ray, &w, level, from, limit)
             && hit.t < limit
         {
             limit = hit.t;
             nearest = Some(hit);
-            // A ray that starts in the box of this level leaves it, once, and the levels beyond
-            // see only what is outside it: none of them is nearer.
-            let beyond = level as usize + 1;
-            if beyond < scene.levels.len() {
-                let (first, end) = scene.hole(beyond);
-                let (first, end) = (
-                    first.map(|f| f << (7 + level)),
-                    end.map(|e| e << (7 + level)),
-                );
-                done |= (0..3).all(|a| ray.cell[a] >= first[a] && ray.cell[a] < end[a]);
-            }
         }
     }
     nearest

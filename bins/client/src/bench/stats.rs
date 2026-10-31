@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// Summary of a series of times in milliseconds. With no samples, every figure is `null`.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Stats {
     pub samples: usize,
     pub mean_ms: Option<f64>,

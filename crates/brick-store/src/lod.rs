@@ -26,6 +26,15 @@ use crate::coord::BrickCoord;
 pub trait BrickSource: Debug + Send + Sync {
     /// The brick at `coord` of mip `level`, where none is held.
     fn brick(&self, level: usize, coord: BrickCoord) -> Brick;
+
+    /// Whether every Voxel of level 0 under the brick at `coord` of `level` is solid, which the
+    /// source knows without reading them: an answer of `true` must be exact, and `false` means
+    /// "not known". A coarse brick that reads as full may still have air under it (a coarse Voxel
+    /// is solid when half its children are), so a renderer that leaves out what no ray can reach
+    /// asks this before it leaves a brick out for good.
+    fn solid_below(&self, _level: usize, _coord: BrickCoord) -> bool {
+        false
+    }
 }
 
 /// A ball at the Planet's centre made of one Material, so that none of its bricks need be held.
@@ -50,6 +59,10 @@ impl BrickSource for Interior {
         } else {
             Brick::AIR
         }
+    }
+
+    fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        coord.within_ball_at(level, self.radius)
     }
 }
 

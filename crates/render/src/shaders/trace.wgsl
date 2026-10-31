@@ -7,11 +7,11 @@
 // ever relative to the ray's `cell`, the integer Voxel the camera is in, so nothing loses
 // precision far from the Planet's origin.
 //
-// The Planet is in levels, finest first: level n has Voxels 2^n times the size of level 0's, in
-// a box of regions around the camera. A level only counts outside the box of the level before
-// it, so that each part of space is seen at one level only, finer near the camera and coarser
-// far from it. Voxel, brick and region coordinates are those of the level being walked; the
-// boxes are in Voxels of level 0, and so are distances along the ray, at every level.
+// The Planet is in levels, finest first: level n has Voxels 2^n times the size of level 0's, and
+// lists only the bricks that the LOD bands select for it (see lod.rs), so that each part of space
+// is seen at one level only, finer near the camera and coarser far from it. Voxel, brick and
+// region coordinates are those of the level being walked; distances along the ray are in Voxels
+// of level 0, at every level.
 
 // Most levels there can be, as in scene.rs.
 const MAX_LEVELS = 20;
@@ -25,8 +25,8 @@ struct Level {
     table_mask: u32,
     occupied_end: vec3<i32>,
     table_base: u32,
-    // The regions of this level's box that the level before it holds instead: from the first
-    // up to, and not including, the end. None if the end is not past the first.
+    // The regions about the camera that no brick of this level is in: from the first up to, and
+    // not including, the end. None if the end is not past the first.
     hole_first: vec3<i32>,
     pad0: u32,
     hole_end: vec3<i32>,
@@ -266,11 +266,9 @@ fn hit_region(ray: Ray, w: Walk, level: u32, region: u32, rc: vec3<i32>, t_in: f
     return miss();
 }
 
-// The first solid Voxel of `level` along the ray, in its box and outside the box of the level
-// before it, if it is between `t_from` and `limit`, or a miss. If the ray starts inside the box of
-// the level before it and leaves it no nearer than `limit`, then so it does for every level
-// after this one, and `done` is set.
-fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32, done: ptr<function, bool>) -> Hit {
+// The first solid Voxel of `level` along the ray, in its box and outside its hole, if it is
+// between `t_from` and `limit`, or a miss.
+fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32) -> Hit {
     let lv = scene.levels[level];
     if any(lv.occupied_end <= lv.occupied_first) {
         return miss();
@@ -306,7 +304,6 @@ fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32, done: ptr<f
         t_start = min3(h_far);
         normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), first_axis(h_far));
         if t_start >= limit {
-            *done = max3(h_near) <= 0.0;
             return miss();
         }
         // The ray may have left the regions that the level lists while it was in the hole.
@@ -323,7 +320,7 @@ fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32, done: ptr<f
         if t >= limit {
             break;
         }
-        // The regions of the hole are the finer level's.
+        // The regions of the hole have no brick of this level.
         if any(rc < lv.hole_first) || any(rc > hole_last) {
             let region = find_region(level, rc);
             if region >= 0 {
@@ -373,23 +370,15 @@ fn trace(ray: Ray) -> Hit {
         limit = along + h;
     }
 
-    // Every level is a part of space of its own, so the nearest hit of all is the first one.
-    // Once there is one, the levels beyond it only need looking at up to it.
+    // Every level is a part of space of its own, so the nearest hit of all is the one that is
+    // nearest: a ray that does not start at the camera meets the levels in any order. Once there
+    // is a hit, the levels after it only need looking at up to it.
     var nearest = miss();
-    var done = false;
-    for (var level = 0u; level < scene.level_count && !done; level++) {
-        let h = hit_level(ray, w, level, t_from, limit, &done);
+    for (var level = 0u; level < scene.level_count; level++) {
+        let h = hit_level(ray, w, level, t_from, limit);
         if h.hit && h.t < limit {
             limit = h.t;
             nearest = h;
-            // A ray that starts in the box of this level leaves it, once, and the levels beyond
-            // see only what is outside it: none of them is nearer.
-            if level + 1u < scene.level_count {
-                let beyond = scene.levels[level + 1u];
-                let first = beyond.hole_first << vec3<u32>(7u + level);
-                let end = beyond.hole_end << vec3<u32>(7u + level);
-                done = done || (all(ray.cell >= first) && all(ray.cell < end));
-            }
         }
     }
     return nearest;

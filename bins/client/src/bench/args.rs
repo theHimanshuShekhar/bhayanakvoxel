@@ -16,19 +16,38 @@ Options:
                    is twice as big in each direction
   --short          A tiny run on a patch of the Planet at low resolution: for a smoke test,
                    not for timings
+  --bias F         LOD bias: output pixels one Voxel may cover [default: 1]. Every switch
+                   distance between levels of detail scales with it; 2 does a quarter of the
+                   work for up to a pixel more of error
+  --diag LIST      Switches for finding out where time goes, separated by commas; a report made
+                   with any of them is not a measurement. no-follow: the Planet does not follow
+                   the camera. no-upload: it does, on the CPU, but the GPU is not told.
+                   no-flush: writes to the GPU go with the next frame's commands. gap-ms=F:
+                   sleep F milliseconds before each frame, as the CPU work of following would
   --no-fail        Exit with status 0 even if a pass is over its budget
   -h, --help       Print this";
 
-#[derive(Debug, PartialEq, Eq)]
+/// What `--diag` switches on. Everything off is a measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Diag {
+    pub no_follow: bool,
+    pub no_upload: bool,
+    pub no_flush: bool,
+    pub gap_ms: f64,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct Args {
     pub out: PathBuf,
     pub budgets: Option<PathBuf>,
     pub short: bool,
     pub no_fail: bool,
     pub size: Option<(u32, u32)>,
+    pub bias: f64,
+    pub diag: Diag,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Parsed {
     Help,
     Run(Args),
@@ -42,6 +61,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         short: false,
         no_fail: false,
         size: None,
+        bias: 1.0,
+        diag: Diag::default(),
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -53,10 +74,41 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
+            "--bias" => parsed.bias = bias(&value("--bias")?)?,
+            "--diag" => parsed.diag = diag(&value("--diag")?)?,
             _ => return Err(format!("unexpected argument `{arg}`")),
         }
     }
     Ok(Parsed::Run(parsed))
+}
+
+/// `--diag`'s comma-separated switches.
+fn diag(text: &str) -> Result<Diag, String> {
+    let mut diag = Diag::default();
+    for item in text.split(',') {
+        match item.split_once('=') {
+            None if item == "no-follow" => diag.no_follow = true,
+            None if item == "no-upload" => diag.no_upload = true,
+            None if item == "no-flush" => diag.no_flush = true,
+            Some(("gap-ms", ms)) => {
+                diag.gap_ms = ms
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|m| m.is_finite() && *m >= 0.0)
+                    .ok_or_else(|| format!("`{ms}` is not a number of milliseconds"))?;
+            }
+            _ => return Err(format!("`{item}` is not a --diag switch")),
+        }
+    }
+    Ok(diag)
+}
+
+/// A LOD bias: a positive, finite number.
+fn bias(text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .ok_or_else(|| format!("`{text}` is not a LOD bias like 1 or 2.5"))
 }
 
 /// `WIDTHxHEIGHT`, both at least 1.
@@ -91,7 +143,9 @@ mod tests {
                 budgets: None,
                 short: false,
                 no_fail: false,
-                size: None
+                size: None,
+                bias: 1.0,
+                diag: Diag::default()
             }
         );
     }
@@ -107,11 +161,32 @@ mod tests {
             "b.toml",
             "--size",
             "640x360",
+            "--bias",
+            "2",
         ]);
         assert_eq!(args.out, PathBuf::from("o"));
         assert_eq!(args.budgets, Some(PathBuf::from("b.toml")));
         assert!(args.short && args.no_fail);
         assert_eq!(args.size, Some((640, 360)));
+        assert_eq!(args.bias, 2.0);
+    }
+
+    #[test]
+    fn diag_switches_are_read_and_a_wrong_one_is_an_error() {
+        let args = run(&["--diag", "no-follow,gap-ms=2.5,no-flush"]);
+        assert_eq!(
+            args.diag,
+            Diag {
+                no_follow: true,
+                no_flush: true,
+                gap_ms: 2.5,
+                ..Diag::default()
+            }
+        );
+        assert!(run(&["--diag", "no-upload"]).diag.no_upload);
+        for bad in ["fast", "gap-ms=x", "gap-ms=-1", "no-follow,"] {
+            assert!(parse_all(&["--diag", bad]).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -129,6 +204,11 @@ mod tests {
             &["--size", "640"],
             &["--size", "0x360"],
             &["--size", "axb"],
+            &["--bias"],
+            &["--bias", "0"],
+            &["--bias", "-1"],
+            &["--bias", "fast"],
+            &["--bias", "inf"],
             &["stray"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
